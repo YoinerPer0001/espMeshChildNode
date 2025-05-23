@@ -9,6 +9,8 @@
 #include "nvs_flash.h"
 #include "esp_mesh.h"
 #include "cJSON.h"
+#include "driver/gpio.h"
+#include <math.h>  // Asegúrate de incluir esto
 
 #define TAG "MESH_NODE"
 #define BUF_SIZE 256
@@ -19,9 +21,64 @@ extern const char root_cert_pem_end[] asm("_binary_root_cert_pem_end");
 #define WIFI_SSID "FLIA PERTUZ"
 #define WIFI_PASS "1079913099"
 
+#define LED_GPIO GPIO_NUM_2
+
+void mesh_receive_task(void *arg)
+{
+    mesh_addr_t from;
+    mesh_data_t data;
+    int flag;
+    esp_err_t err;
+
+    uint8_t rx_buf[150];
+    data.data = rx_buf;
+    data.size = sizeof(rx_buf);
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    while (1)
+    {
+        err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
+        if (err == ESP_OK)
+        {
+            ESP_LOGI("MESH_RECV", "Mensaje desde %02x:%02x:%02x:%02x:%02x:%02x -> %s",
+                     from.addr[0], from.addr[1], from.addr[2],
+                     from.addr[3], from.addr[4], from.addr[5],
+                     (char *)data.data);
+
+            cJSON *root = cJSON_Parse((char *)data.data);
+
+            if (root != NULL)
+            {
+                cJSON *flag_item = cJSON_GetObjectItem(root, "flag");
+                if (flag_item != NULL && cJSON_IsNumber(flag_item))
+                {
+                    if (flag_item->valueint == 1)
+                    {
+                        gpio_set_level(LED_GPIO, 1);
+                    }
+                    else
+                    {
+                        gpio_set_level(LED_GPIO, 0);
+                    }
+                }
+                cJSON_Delete(root); // Liberar memoria del JSON
+            }
+            else
+            {
+                ESP_LOGE("JSON", "Error al parsear JSON");
+            }
+        }
+        else
+        {
+            ESP_LOGE("MESH_RECV", "Error al recibir datos: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 // data mesh
 static uint8_t MESH_ID[6] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB};
-#define CONFIG_MESH_CHANNEL 5 // Canal 1
+#define CONFIG_MESH_CHANNEL 11 // Canal 1
 #define CONFIG_MESH_AP_CONNECTIONS 10
 #define CONFIG_MESH_AP_PASSWD "meshTest"
 static const char *MESH_TAG = "mesh_main";
@@ -36,7 +93,7 @@ void ip_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(MESH_TAG, "<IP_EVENT_STA_GOT_IP>IP:" IPSTR, IP2STR(&event->ip_info.ip));
 }
 
-static bool is_root = false; // Variable para determinar si el nodo es root
+static bool is_root = false;
 
 void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -56,7 +113,7 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
         break;
     case MESH_EVENT_PARENT_CONNECTED:
         ESP_LOGI(TAG, "Conectado al padre");
-        //encender led
+        // encender led
 
         if (esp_mesh_is_root())
         {
@@ -179,14 +236,19 @@ void mesh_send_data(const char *msg)
             ESP_LOGE("MESH_SEND", "Error desconocido");
             break;
         }
-    }else{
+    }
+    else
+    {
         ESP_LOGI("MESH_SEND", "El mensaje se ha enviado: %s", mesh_data.data);
-
     }
 }
 
 void mesh_send_task(void *pvParameters)
 {
+    // Lista de sensores
+    const char *sensor_names[] = {"Temperatura", "Humedad"};
+    const int num_sensores = sizeof(sensor_names) / sizeof(sensor_names[0]);
+
     while (true)
     {
         // Crear un objeto cJSON
@@ -194,9 +256,13 @@ void mesh_send_task(void *pvParameters)
         cJSON *sensores = cJSON_CreateObject();
 
         // Añadir datos al JSON
-        cJSON_AddStringToObject(root, "id", "5456414524");
-        cJSON_AddNumberToObject(sensores, "Temperatura", 3.6);
-        cJSON_AddNumberToObject(sensores, "Humedad", 1.2);
+        cJSON_AddStringToObject(root, "id", "cc:7b:5c:1e:f8:b8");
+
+        float temperatura = floorf((20.0 + (esp_random() % 1500) / 100.0f) * 100) / 100.0f;
+        float humedad = floorf((30.0 + (esp_random() % 700) / 10.0f) * 100) / 100.0f;
+
+        cJSON_AddNumberToObject(sensores, "Temperatura", temperatura);
+        cJSON_AddNumberToObject(sensores, "Humedad", humedad);
 
         // Añadir el objeto "sensores" al objeto raíz
         cJSON_AddItemToObject(root, "sensores", sensores);
@@ -211,15 +277,18 @@ void mesh_send_task(void *pvParameters)
         free(json_str);
         cJSON_Delete(root);
 
-        vTaskDelay(pdMS_TO_TICKS(10000)); // cada 10 segundos
+        vTaskDelay(pdMS_TO_TICKS(5000)); // cada 10 segundos
     }
 }
 
 void app_main(void)
 {
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 1);
     nvs_flash_init();
     wifi_init();
     mesh_init();
     // Crear una tarea para la envio de datos
     xTaskCreate(&mesh_send_task, "Mesh_send_Task", 4096, NULL, 5, NULL);
+    xTaskCreate(mesh_receive_task, "mesh_recv", 4096, NULL, 5, NULL);
 }
